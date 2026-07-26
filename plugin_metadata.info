@@ -1,0 +1,13 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-06-11
+
+[language.graphql]
+language_name = GraphQL
+language_short_name = GraphQL
+monaco_language = graphql
+default_filename = schema.graphql
+language_file_extensions = .graphql,.gql
