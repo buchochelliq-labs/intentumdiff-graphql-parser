@@ -1,7 +1,7 @@
-# Bundled parser metadata for the IntentDiff language-info API.
+# Bundled parser metadata for the IntentumDiff language-info API.
 
 [plugin]
-author = IntentDiff
+author = IntentumDiff
 plugin_version = 0.1.0
 last_updated = 2026-06-11
 
