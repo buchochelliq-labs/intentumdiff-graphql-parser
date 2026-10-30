@@ -486,10 +486,10 @@ mod tests {
             let expected_start = line.find(label).unwrap() as u32;
             assert_eq!(node.node_type, "argument");
             assert_eq!(node.label, label);
-            assert_eq!(node.start_line, 1);
-            assert_eq!(node.end_line, 1);
-            assert_eq!(node.start_col, expected_start);
-            assert_eq!(node.end_col, expected_start + label.len() as u32);
+            assert_eq!(node.position.start_line, 1);
+            assert_eq!(node.position.end_line, 1);
+            assert_eq!(node.position.start_col, expected_start);
+            assert_eq!(node.position.end_col, expected_start + label.len() as u32);
         }
     }
 
@@ -506,10 +506,10 @@ mod tests {
         assert_ne!(old_arg.structural_hash, new_arg.structural_hash);
         assert_eq!(old_arg.label, "limit: 25");
         assert_eq!(new_arg.label, "limit: 26");
-        assert_eq!(old_arg.start_col, 11);
-        assert_eq!(new_arg.start_col, 11);
-        assert_eq!(old_arg.end_col, 20);
-        assert_eq!(new_arg.end_col, 20);
+        assert_eq!(old_arg.position.start_col, 11);
+        assert_eq!(new_arg.position.start_col, 11);
+        assert_eq!(old_arg.position.end_col, 20);
+        assert_eq!(new_arg.position.end_col, 20);
     }
 
     #[test]
@@ -520,9 +520,9 @@ mod tests {
         let source_line = source.lines().nth(1).unwrap();
         let start = source_line.find("limit: 25").unwrap() as u32;
 
-        assert_eq!(argument.start_col, start);
-        assert_eq!(argument.end_col, start + "limit: 25".len() as u32);
-        assert_eq!(&source_line.as_bytes()[start as usize..argument.end_col as usize], b"limit: 25");
+        assert_eq!(argument.position.start_col, start);
+        assert_eq!(argument.position.end_col, start + "limit: 25".len() as u32);
+        assert_eq!(&source_line.as_bytes()[start as usize..argument.position.end_col as usize], b"limit: 25");
     }
 
     #[test]
