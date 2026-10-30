@@ -199,13 +199,13 @@ fn field_node(id: &str, statement: &str, line: u32, col: u32) -> SemanticNode {
 
 fn metadata_children(id: &str, statement: &str, line: u32, col: u32) -> Vec<SemanticNode> {
     let mut children = Vec::new();
-    for (index, argument) in extract_arguments(statement).into_iter().enumerate() {
+    for (index, (argument, offset)) in extract_arguments(statement).into_iter().enumerate() {
         children.push(node(
             &format!("{id}.{index}"),
             "argument",
             &argument,
             line,
-            col,
+            col + offset as u32,
             &[],
         ));
     }
@@ -241,22 +241,24 @@ fn field_label(statement: &str) -> String {
         .to_string()
 }
 
-fn extract_arguments(statement: &str) -> Vec<String> {
+fn extract_arguments(statement: &str) -> Vec<(String, usize)> {
     let Some(start) = statement.find('(') else {
         return Vec::new();
     };
     let Some(end) = statement[start + 1..].find(')') else {
         return Vec::new();
     };
+    // Column positions in the WIT tree are UTF-8 byte offsets. Preserve the
+    // position of each argument within the original (unindented) statement,
+    // rather than assigning every argument the enclosing field's column.
+    let mut cursor = start + 1;
     statement[start + 1..start + 1 + end]
         .split(',')
         .filter_map(|part| {
             let trimmed = part.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
+            let offset = cursor + part.len() - part.trim_start().len();
+            cursor += part.len() + 1;
+            (!trimmed.is_empty()).then(|| (trimmed.to_string(), offset))
         })
         .collect()
 }
@@ -470,6 +472,57 @@ mod tests {
             old.children[0].structural_hash, new.children[0].structural_hash,
             "type_definition hash must see the added field"
         );
+    }
+
+    #[test]
+    fn graphql_argument_spans_match_source_byte_columns() {
+        let source = "query RecentInvoices {\n  invoices(limit: 25, offset: 5) {\n    reference\n  }\n}\n";
+        let root: SemanticNode = serde_json::from_str(&parse_graphql(source)).unwrap();
+        let arguments = &root.children[0].children[0].children;
+        let line = source.lines().nth(1).unwrap();
+
+        assert_eq!(arguments.len(), 2);
+        for (node, label) in arguments.iter().zip(["limit: 25", "offset: 5"]) {
+            let expected_start = line.find(label).unwrap() as u32;
+            assert_eq!(node.node_type, "argument");
+            assert_eq!(node.label, label);
+            assert_eq!(node.start_line, 1);
+            assert_eq!(node.end_line, 1);
+            assert_eq!(node.start_col, expected_start);
+            assert_eq!(node.end_col, expected_start + label.len() as u32);
+        }
+    }
+
+    #[test]
+    fn graphql_numeric_mutation_has_source_anchored_old_and_new_spans() {
+        let old_source = "query Q {\n  invoices(limit: 25)\n}\n";
+        let new_source = "query Q {\n  invoices(limit: 26)\n}\n";
+        let old: SemanticNode = serde_json::from_str(&parse_graphql(old_source)).unwrap();
+        let new: SemanticNode = serde_json::from_str(&parse_graphql(new_source)).unwrap();
+        let old_arg = &old.children[0].children[0].children[0];
+        let new_arg = &new.children[0].children[0].children[0];
+
+        assert_ne!(old.structural_hash, new.structural_hash);
+        assert_ne!(old_arg.structural_hash, new_arg.structural_hash);
+        assert_eq!(old_arg.label, "limit: 25");
+        assert_eq!(new_arg.label, "limit: 26");
+        assert_eq!(old_arg.start_col, 11);
+        assert_eq!(new_arg.start_col, 11);
+        assert_eq!(old_arg.end_col, 20);
+        assert_eq!(new_arg.end_col, 20);
+    }
+
+    #[test]
+    fn graphql_argument_columns_are_utf8_byte_offsets() {
+        let source = "query Q {\n  α: invoices(limit: 25)\n}\n";
+        let root: SemanticNode = serde_json::from_str(&parse_graphql(source)).unwrap();
+        let argument = &root.children[0].children[0].children[0];
+        let source_line = source.lines().nth(1).unwrap();
+        let start = source_line.find("limit: 25").unwrap() as u32;
+
+        assert_eq!(argument.start_col, start);
+        assert_eq!(argument.end_col, start + "limit: 25".len() as u32);
+        assert_eq!(&source_line.as_bytes()[start as usize..argument.end_col as usize], b"limit: 25");
     }
 
     #[test]
