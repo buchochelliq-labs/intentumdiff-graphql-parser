@@ -82,12 +82,16 @@ fn parse_graphql(source: &str) -> String {
                 &root_children,
             );
             let children = metadata_children(&id, &normalized, parsed.line, parsed.indent as u32);
+            // Definition labels refer to the name after the GraphQL keyword.
+            // Use its original UTF-8 byte column, not the keyword's start.
+            let label_col = parsed.indent as u32
+                + normalized.find(label.as_str()).unwrap_or(0) as u32;
             let node = node(
                 &id,
                 node_type,
                 &label,
                 parsed.line,
-                parsed.indent as u32,
+                label_col,
                 &children,
             );
             stack.push(DefinitionFrame {
@@ -513,4 +517,23 @@ fragment UserFields on User {
         assert!(arguments.contains(&"$id: ID!".to_string()));
         assert!(directives.contains(&"@deprecated".to_string()));
     }
+
+    #[test]
+    fn declaration_and_operation_names_use_original_utf8_source_columns() {
+        let source = "type User {\n  id: ID\n}\n\nquery RecentInvoices {\n  invoices\n}\n";
+        let parsed: serde_json::Value =
+            serde_json::from_str(&parse_graphql(source)).unwrap();
+        let definitions = parsed["children"].as_array().unwrap();
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions[0]["label"], "User");
+        assert_eq!(definitions[0]["position"]["start_col"].as_u64(), Some(5));
+        assert_eq!(definitions[0]["position"]["end_col"].as_u64(), Some(9));
+        assert_eq!(definitions[1]["label"], "RecentInvoices");
+        assert_eq!(definitions[1]["position"]["start_col"].as_u64(), Some(6));
+        assert_eq!(
+            definitions[1]["position"]["end_col"].as_u64(),
+            Some(6 + "RecentInvoices".len() as u64)
+        );
+    }
+
 }
