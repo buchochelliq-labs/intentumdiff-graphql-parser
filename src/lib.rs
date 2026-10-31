@@ -161,10 +161,8 @@ fn normalized_lines(source: &str) -> Vec<ParsedLine> {
             if trimmed.is_empty() {
                 return None;
             }
-            let indent = without_comment
-                .chars()
-                .take_while(|ch| ch.is_whitespace())
-                .count();
+            // Parser positions are UTF-8 byte columns, not Unicode char indices.
+            let indent = without_comment.len() - without_comment.trim_start().len();
             Some(ParsedLine {
                 indent,
                 line: index as u32,
@@ -219,24 +217,41 @@ fn field_node(id: &str, statement: &str, line: u32, col: u32) -> SemanticNode {
 
 fn metadata_children(id: &str, statement: &str, line: u32, col: u32) -> Vec<SemanticNode> {
     let mut children = Vec::new();
+    // The enclosing field starts at col, but arguments are later on the line.
+    // Locate each literal argument after its predecessor, preserving original
+    // UTF-8 byte offsets (including repeated labels and multibyte values).
+    let mut argument_cursor = statement.find('(').map_or(0, |index| index + 1);
     for (index, argument) in extract_arguments(statement).into_iter().enumerate() {
+        // extract_arguments returns literal slices of statement, so the
+        // sequential lookup is guaranteed to succeed for a valid extraction.
+        let start = statement[argument_cursor..]
+            .find(argument.as_str())
+            .map(|offset| argument_cursor + offset)
+            .expect("extracted argument must exist in source statement");
+        argument_cursor = start + argument.len();
         children.push(node(
             &format!("{id}.{index}"),
             "argument",
             &argument,
             line,
-            col,
+            col + start as u32,
             &[],
         ));
     }
     let directive_start = children.len();
+    let mut directive_cursor = 0usize;
     for (index, directive) in extract_directives(statement).into_iter().enumerate() {
+        let start = statement[directive_cursor..]
+            .find(directive.as_str())
+            .map(|offset| directive_cursor + offset)
+            .expect("extracted directive must exist in source statement");
+        directive_cursor = start + directive.len();
         children.push(node(
             &format!("{id}.{}", directive_start + index),
             "directive",
             &directive,
             line,
-            col,
+            col + start as u32,
             &[],
         ));
     }
@@ -532,6 +547,56 @@ fragment UserFields on User {
         assert!(fields.contains(&"displayName".to_string()));
         assert!(arguments.contains(&"$id: ID!".to_string()));
         assert!(directives.contains(&"@deprecated".to_string()));
+    }
+
+    #[test]
+    fn argument_and_directive_positions_use_original_utf8_source_bytes() {
+        // Regression for Python's 74-language source-judged corpus:
+        // "  invoices(limit: 25) {" previously anchored the argument at
+        // column 2 (the field), rather than column 11 (the argument).
+        let statement = "  invoices(limit: 25) {";
+        let source = format!("query RecentInvoices {{\n{statement}\n}}\n");
+        let root: serde_json::Value = serde_json::from_str(&parse_graphql(&source)).unwrap();
+        let argument = &root["children"][0]["children"][0]["children"][0];
+        assert_eq!(argument["label"], "limit: 25");
+        assert_eq!(argument["position"]["start_line"].as_u64(), Some(1));
+        assert_eq!(argument["position"]["start_col"].as_u64(), Some(11));
+        assert_eq!(argument["position"]["end_col"].as_u64(), Some(20));
+
+        // Multiple arguments and a directive, including multibyte UTF-8
+        // before subsequent arguments and repeated argument labels.
+        let statement = "  invoices(note: \"café\", limit: 25, limit: 25) @cache";
+        let source = format!("query RecentInvoices {{\n{statement}\n}}\n");
+        let root: serde_json::Value = serde_json::from_str(&parse_graphql(&source)).unwrap();
+        let children = root["children"][0]["children"][0]["children"].as_array().unwrap();
+        let labels = ["note: \"café\"", "limit: 25", "limit: 25", "@cache"];
+        assert_eq!(children.len(), labels.len());
+        let mut cursor = 0;
+        for (child, label) in children.iter().zip(labels) {
+            let start = statement[cursor..].find(label).unwrap() + cursor;
+            assert_eq!(child["label"], label);
+            assert_eq!(child["position"]["start_col"].as_u64(), Some(start as u64));
+            assert_eq!(
+                child["position"]["end_col"].as_u64(),
+                Some((start + label.len()) as u64)
+            );
+            cursor = start + label.len();
+        }
+
+        // A numeric literal change must remain source-anchored, not style-only.
+        let old: SemanticNode = serde_json::from_str(
+            &parse_graphql("query RecentInvoices {\n  invoices(limit: 5)\n}\n"),
+        ).unwrap();
+        let new: SemanticNode = serde_json::from_str(
+            &parse_graphql("query RecentInvoices {\n  invoices(limit: 25)\n}\n"),
+        ).unwrap();
+        assert_ne!(old.structural_hash, new.structural_hash);
+        let old_arg = &old.children[0].children[0].children[0];
+        let new_arg = &new.children[0].children[0].children[0];
+        assert_eq!(old_arg.position.start_col, 11);
+        assert_eq!(new_arg.position.start_col, 11);
+        assert_eq!(old_arg.label, "limit: 5");
+        assert_eq!(new_arg.label, "limit: 25");
     }
 
     #[test]
