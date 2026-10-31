@@ -217,41 +217,26 @@ fn field_node(id: &str, statement: &str, line: u32, col: u32) -> SemanticNode {
 
 fn metadata_children(id: &str, statement: &str, line: u32, col: u32) -> Vec<SemanticNode> {
     let mut children = Vec::new();
-    // The enclosing field starts at col, but arguments are later on the line.
-    // Locate each literal argument after its predecessor, preserving original
-    // UTF-8 byte offsets (including repeated labels and multibyte values).
-    let mut argument_cursor = statement.find('(').map_or(0, |index| index + 1);
-    for (index, argument) in extract_arguments(statement).into_iter().enumerate() {
-        // extract_arguments returns literal slices of statement, so the
-        // sequential lookup is guaranteed to succeed for a valid extraction.
-        let start = statement[argument_cursor..]
-            .find(argument.as_str())
-            .map(|offset| argument_cursor + offset)
-            .expect("extracted argument must exist in source statement");
-        argument_cursor = start + argument.len();
+    // The extracted offsets are measured in original UTF-8 statement bytes,
+    // not the enclosing field's column. This also handles repeated labels.
+    for (index, (argument, offset)) in extract_arguments(statement).into_iter().enumerate() {
         children.push(node(
             &format!("{id}.{index}"),
             "argument",
             &argument,
             line,
-            col + start as u32,
+            col + offset as u32,
             &[],
         ));
     }
     let directive_start = children.len();
-    let mut directive_cursor = 0usize;
-    for (index, directive) in extract_directives(statement).into_iter().enumerate() {
-        let start = statement[directive_cursor..]
-            .find(directive.as_str())
-            .map(|offset| directive_cursor + offset)
-            .expect("extracted directive must exist in source statement");
-        directive_cursor = start + directive.len();
+    for (index, (directive, offset)) in extract_directives(statement).into_iter().enumerate() {
         children.push(node(
             &format!("{id}.{}", directive_start + index),
             "directive",
             &directive,
             line,
-            col + start as u32,
+            col + offset as u32,
             &[],
         ));
     }
@@ -276,41 +261,37 @@ fn field_label(statement: &str) -> String {
         .to_string()
 }
 
-fn extract_arguments(statement: &str) -> Vec<String> {
+fn extract_arguments(statement: &str) -> Vec<(String, usize)> {
     let Some(start) = statement.find('(') else {
         return Vec::new();
     };
     let Some(end) = statement[start + 1..].find(')') else {
         return Vec::new();
     };
+    // Source byte offsets are captured while slicing; no subsequent string
+    // search or unchecked assumption about the token position is required.
+    let mut cursor = start + 1;
     statement[start + 1..start + 1 + end]
         .split(',')
         .filter_map(|part| {
             let trimmed = part.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
+            let offset = cursor + part.len() - part.trim_start().len();
+            cursor += part.len() + 1;
+            (!trimmed.is_empty()).then(|| (trimmed.to_string(), offset))
         })
         .collect()
 }
 
-fn extract_directives(statement: &str) -> Vec<String> {
+fn extract_directives(statement: &str) -> Vec<(String, usize)> {
     statement
-        .split('@')
-        .skip(1)
-        .filter_map(|part| {
-            let name = part
+        .match_indices('@')
+        .filter_map(|(offset, _)| {
+            let name = statement[offset + 1..]
                 .split(|ch: char| ch.is_whitespace() || ch == '(' || ch == '{' || ch == '}')
                 .next()
                 .unwrap_or("")
                 .trim();
-            if name.is_empty() {
-                None
-            } else {
-                Some(format!("@{name}"))
-            }
+            (!name.is_empty()).then(|| (format!("@{name}"), offset))
         })
         .collect()
 }
