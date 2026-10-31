@@ -84,8 +84,24 @@ fn parse_graphql(source: &str) -> String {
             let children = metadata_children(&id, &normalized, parsed.line, parsed.indent as u32);
             // Definition labels refer to the name after the GraphQL keyword.
             // Use its original UTF-8 byte column, not the keyword's start.
+            // Search after the declaration keyword(s), so names like "t"
+            // cannot accidentally anchor to the first byte of "type".
+            let keyword_count = if normalized.starts_with("extend ") { 2 } else { 1 };
+            let mut name_region = normalized.as_str();
+            let mut name_offset = 0usize;
+            for _ in 0..keyword_count {
+                let word_end = name_region.find(char::is_whitespace)
+                    .unwrap_or(name_region.len());
+                name_offset += word_end;
+                name_region = &name_region[word_end..];
+                let whitespace = name_region.len() - name_region.trim_start().len();
+                name_offset += whitespace;
+                name_region = &name_region[whitespace..];
+            }
             let label_col = parsed.indent as u32
-                + normalized.find(label.as_str()).unwrap_or(0) as u32;
+                + name_region.find(label.as_str()).map(|index| name_offset + index)
+                    .or_else(|| normalized.find(label.as_str()))
+                    .unwrap_or(0) as u32;
             let node = node(
                 &id,
                 node_type,
@@ -525,6 +541,12 @@ fragment UserFields on User {
             serde_json::from_str(&parse_graphql(source)).unwrap();
         let definitions = parsed["children"].as_array().unwrap();
         assert_eq!(definitions.len(), 2);
+        let ambiguous: serde_json::Value =
+            serde_json::from_str(&parse_graphql("type t {\n  id: ID\n}\n")).unwrap();
+        assert_eq!(ambiguous["children"][0]["label"], "t");
+        assert_eq!(ambiguous["children"][0]["position"]["start_col"], 5);
+        assert_eq!(ambiguous["children"][0]["position"]["end_col"], 6);
+
         assert_eq!(definitions[0]["label"], "User");
         assert_eq!(definitions[0]["position"]["start_col"].as_u64(), Some(5));
         assert_eq!(definitions[0]["position"]["end_col"].as_u64(), Some(9));
