@@ -489,6 +489,57 @@ mod tests {
     }
 
     #[test]
+    fn graphql_argument_spans_match_source_byte_columns() {
+        let source = "query RecentInvoices {\n  invoices(limit: 25, offset: 5) {\n    reference\n  }\n}\n";
+        let root: SemanticNode = serde_json::from_str(&parse_graphql(source)).unwrap();
+        let arguments = &root.children[0].children[0].children;
+        let line = source.lines().nth(1).unwrap();
+
+        assert_eq!(arguments.len(), 2);
+        for (node, label) in arguments.iter().zip(["limit: 25", "offset: 5"]) {
+            let expected_start = line.find(label).unwrap() as u32;
+            assert_eq!(node.node_type, "argument");
+            assert_eq!(node.label, label);
+            assert_eq!(node.position.start_line, 1);
+            assert_eq!(node.position.end_line, 1);
+            assert_eq!(node.position.start_col, expected_start);
+            assert_eq!(node.position.end_col, expected_start + label.len() as u32);
+        }
+    }
+
+    #[test]
+    fn graphql_numeric_mutation_has_source_anchored_old_and_new_spans() {
+        let old_source = "query Q {\n  invoices(limit: 25)\n}\n";
+        let new_source = "query Q {\n  invoices(limit: 26)\n}\n";
+        let old: SemanticNode = serde_json::from_str(&parse_graphql(old_source)).unwrap();
+        let new: SemanticNode = serde_json::from_str(&parse_graphql(new_source)).unwrap();
+        let old_arg = &old.children[0].children[0].children[0];
+        let new_arg = &new.children[0].children[0].children[0];
+
+        assert_ne!(old.structural_hash, new.structural_hash);
+        assert_ne!(old_arg.structural_hash, new_arg.structural_hash);
+        assert_eq!(old_arg.label, "limit: 25");
+        assert_eq!(new_arg.label, "limit: 26");
+        assert_eq!(old_arg.position.start_col, 11);
+        assert_eq!(new_arg.position.start_col, 11);
+        assert_eq!(old_arg.position.end_col, 20);
+        assert_eq!(new_arg.position.end_col, 20);
+    }
+
+    #[test]
+    fn graphql_argument_columns_are_utf8_byte_offsets() {
+        let source = "query Q {\n  α: invoices(limit: 25)\n}\n";
+        let root: SemanticNode = serde_json::from_str(&parse_graphql(source)).unwrap();
+        let argument = &root.children[0].children[0].children[0];
+        let source_line = source.lines().nth(1).unwrap();
+        let start = source_line.find("limit: 25").unwrap() as u32;
+
+        assert_eq!(argument.position.start_col, start);
+        assert_eq!(argument.position.end_col, start + "limit: 25".len() as u32);
+        assert_eq!(&source_line.as_bytes()[start as usize..argument.position.end_col as usize], b"limit: 25");
+    }
+
+    #[test]
     fn process_extracts_schema_operation_fragment_and_directives() {
         let parsed = parse_graphql(
             r#"
