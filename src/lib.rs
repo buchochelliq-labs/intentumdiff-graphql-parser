@@ -82,12 +82,32 @@ fn parse_graphql(source: &str) -> String {
                 &root_children,
             );
             let children = metadata_children(&id, &normalized, parsed.line, parsed.indent as u32);
+            // Definition labels refer to the name after the GraphQL keyword.
+            // Use its original UTF-8 byte column, not the keyword's start.
+            // Search after the declaration keyword(s), so names like "t"
+            // cannot accidentally anchor to the first byte of "type".
+            let keyword_count = if normalized.starts_with("extend ") { 2 } else { 1 };
+            let mut name_region = normalized.as_str();
+            let mut name_offset = 0usize;
+            for _ in 0..keyword_count {
+                let word_end = name_region.find(char::is_whitespace)
+                    .unwrap_or(name_region.len());
+                name_offset += word_end;
+                name_region = &name_region[word_end..];
+                let whitespace = name_region.len() - name_region.trim_start().len();
+                name_offset += whitespace;
+                name_region = &name_region[whitespace..];
+            }
+            let label_col = parsed.indent as u32
+                + name_region.find(label.as_str()).map(|index| name_offset + index)
+                    .or_else(|| normalized.find(label.as_str()))
+                    .unwrap_or(0) as u32;
             let node = node(
                 &id,
                 node_type,
                 &label,
                 parsed.line,
-                parsed.indent as u32,
+                label_col,
                 &children,
             );
             stack.push(DefinitionFrame {
@@ -141,10 +161,8 @@ fn normalized_lines(source: &str) -> Vec<ParsedLine> {
             if trimmed.is_empty() {
                 return None;
             }
-            let indent = without_comment
-                .chars()
-                .take_while(|ch| ch.is_whitespace())
-                .count();
+            // Parser positions are UTF-8 byte columns, not Unicode char indices.
+            let indent = without_comment.len() - without_comment.trim_start().len();
             Some(ParsedLine {
                 indent,
                 line: index as u32,
@@ -199,6 +217,8 @@ fn field_node(id: &str, statement: &str, line: u32, col: u32) -> SemanticNode {
 
 fn metadata_children(id: &str, statement: &str, line: u32, col: u32) -> Vec<SemanticNode> {
     let mut children = Vec::new();
+    // The extracted offsets are measured in original UTF-8 statement bytes,
+    // not the enclosing field's column. This also handles repeated labels.
     for (index, (argument, offset)) in extract_arguments(statement).into_iter().enumerate() {
         children.push(node(
             &format!("{id}.{index}"),
@@ -210,13 +230,13 @@ fn metadata_children(id: &str, statement: &str, line: u32, col: u32) -> Vec<Sema
         ));
     }
     let directive_start = children.len();
-    for (index, directive) in extract_directives(statement).into_iter().enumerate() {
+    for (index, (directive, offset)) in extract_directives(statement).into_iter().enumerate() {
         children.push(node(
             &format!("{id}.{}", directive_start + index),
             "directive",
             &directive,
             line,
-            col,
+            col + offset as u32,
             &[],
         ));
     }
@@ -248,9 +268,8 @@ fn extract_arguments(statement: &str) -> Vec<(String, usize)> {
     let Some(end) = statement[start + 1..].find(')') else {
         return Vec::new();
     };
-    // Column positions in the WIT tree are UTF-8 byte offsets. Preserve the
-    // position of each argument within the original (unindented) statement,
-    // rather than assigning every argument the enclosing field's column.
+    // Source byte offsets are captured while slicing; no subsequent string
+    // search or unchecked assumption about the token position is required.
     let mut cursor = start + 1;
     statement[start + 1..start + 1 + end]
         .split(',')
@@ -263,21 +282,16 @@ fn extract_arguments(statement: &str) -> Vec<(String, usize)> {
         .collect()
 }
 
-fn extract_directives(statement: &str) -> Vec<String> {
+fn extract_directives(statement: &str) -> Vec<(String, usize)> {
     statement
-        .split('@')
-        .skip(1)
-        .filter_map(|part| {
-            let name = part
+        .match_indices('@')
+        .filter_map(|(offset, _)| {
+            let name = statement[offset + 1..]
                 .split(|ch: char| ch.is_whitespace() || ch == '(' || ch == '{' || ch == '}')
                 .next()
                 .unwrap_or("")
                 .trim();
-            if name.is_empty() {
-                None
-            } else {
-                Some(format!("@{name}"))
-            }
+            (!name.is_empty()).then(|| (format!("@{name}"), offset))
         })
         .collect()
 }
@@ -566,4 +580,79 @@ fragment UserFields on User {
         assert!(arguments.contains(&"$id: ID!".to_string()));
         assert!(directives.contains(&"@deprecated".to_string()));
     }
+
+    #[test]
+    fn argument_and_directive_positions_use_original_utf8_source_bytes() {
+        // Regression for Python's 74-language source-judged corpus:
+        // "  invoices(limit: 25) {" previously anchored the argument at
+        // column 2 (the field), rather than column 11 (the argument).
+        let statement = "  invoices(limit: 25) {";
+        let source = format!("query RecentInvoices {{\n{statement}\n}}\n");
+        let root: serde_json::Value = serde_json::from_str(&parse_graphql(&source)).unwrap();
+        let argument = &root["children"][0]["children"][0]["children"][0];
+        assert_eq!(argument["label"], "limit: 25");
+        assert_eq!(argument["position"]["start_line"].as_u64(), Some(1));
+        assert_eq!(argument["position"]["start_col"].as_u64(), Some(11));
+        assert_eq!(argument["position"]["end_col"].as_u64(), Some(20));
+
+        // Multiple arguments and a directive, including multibyte UTF-8
+        // before subsequent arguments and repeated argument labels.
+        let statement = "  invoices(note: \"café\", limit: 25, limit: 25) @cache";
+        let source = format!("query RecentInvoices {{\n{statement}\n}}\n");
+        let root: serde_json::Value = serde_json::from_str(&parse_graphql(&source)).unwrap();
+        let children = root["children"][0]["children"][0]["children"].as_array().unwrap();
+        let labels = ["note: \"café\"", "limit: 25", "limit: 25", "@cache"];
+        assert_eq!(children.len(), labels.len());
+        let mut cursor = 0;
+        for (child, label) in children.iter().zip(labels) {
+            let start = statement[cursor..].find(label).unwrap() + cursor;
+            assert_eq!(child["label"], label);
+            assert_eq!(child["position"]["start_col"].as_u64(), Some(start as u64));
+            assert_eq!(
+                child["position"]["end_col"].as_u64(),
+                Some((start + label.len()) as u64)
+            );
+            cursor = start + label.len();
+        }
+
+        // A numeric literal change must remain source-anchored, not style-only.
+        let old: SemanticNode = serde_json::from_str(
+            &parse_graphql("query RecentInvoices {\n  invoices(limit: 5)\n}\n"),
+        ).unwrap();
+        let new: SemanticNode = serde_json::from_str(
+            &parse_graphql("query RecentInvoices {\n  invoices(limit: 25)\n}\n"),
+        ).unwrap();
+        assert_ne!(old.structural_hash, new.structural_hash);
+        let old_arg = &old.children[0].children[0].children[0];
+        let new_arg = &new.children[0].children[0].children[0];
+        assert_eq!(old_arg.position.start_col, 11);
+        assert_eq!(new_arg.position.start_col, 11);
+        assert_eq!(old_arg.label, "limit: 5");
+        assert_eq!(new_arg.label, "limit: 25");
+    }
+
+    #[test]
+    fn declaration_and_operation_names_use_original_utf8_source_columns() {
+        let source = "type User {\n  id: ID\n}\n\nquery RecentInvoices {\n  invoices\n}\n";
+        let parsed: serde_json::Value =
+            serde_json::from_str(&parse_graphql(source)).unwrap();
+        let definitions = parsed["children"].as_array().unwrap();
+        assert_eq!(definitions.len(), 2);
+        let ambiguous: serde_json::Value =
+            serde_json::from_str(&parse_graphql("type t {\n  id: ID\n}\n")).unwrap();
+        assert_eq!(ambiguous["children"][0]["label"], "t");
+        assert_eq!(ambiguous["children"][0]["position"]["start_col"], 5);
+        assert_eq!(ambiguous["children"][0]["position"]["end_col"], 6);
+
+        assert_eq!(definitions[0]["label"], "User");
+        assert_eq!(definitions[0]["position"]["start_col"].as_u64(), Some(5));
+        assert_eq!(definitions[0]["position"]["end_col"].as_u64(), Some(9));
+        assert_eq!(definitions[1]["label"], "RecentInvoices");
+        assert_eq!(definitions[1]["position"]["start_col"].as_u64(), Some(6));
+        assert_eq!(
+            definitions[1]["position"]["end_col"].as_u64(),
+            Some(6 + "RecentInvoices".len() as u64)
+        );
+    }
+
 }
