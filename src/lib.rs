@@ -74,6 +74,19 @@ struct Token<'a> {
     end: (u32, u32),
 }
 
+const BOM: &[u8] = "\u{feff}".as_bytes();
+
+/// Byte width of the UTF-8 character introduced by `lead` (1 for a stray
+/// continuation byte, so the scanner always makes progress).
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        0xF0..=0xF7 => 4,
+        0xE0..=0xEF => 3,
+        0xC0..=0xDF => 2,
+        _ => 1,
+    }
+}
+
 /// GraphQL lexer (October 2021 spec §2.1). Whitespace, line terminators,
 /// commas, the BOM and `#` comments are insignificant and dropped; a `#`
 /// inside a string or block string is part of the string value.
@@ -115,15 +128,18 @@ fn tokenize(source: &str) -> Vec<Token<'_>> {
             }
             _ => {}
         }
-        if source[index..].starts_with('\u{feff}') {
-            index += '\u{feff}'.len_utf8();
+        // All delimiter checks are byte-wise: `index`/`cursor` may sit on any
+        // byte of a multibyte character inside a string, so `&source[i..]`
+        // would panic there. Every token still ends on a char boundary.
+        if bytes[index..].starts_with(BOM) {
+            index += BOM.len();
             continue;
         }
 
         let start_index = index;
         let start = (line, (index - line_start) as u32);
         let kind;
-        if source[index..].starts_with("\"\"\"") {
+        if bytes[index..].starts_with(b"\"\"\"") {
             // Block string: runs to the next unescaped `"""` (or EOF).
             kind = TokenKind::Str;
             let mut cursor = index + 3;
@@ -131,9 +147,9 @@ fn tokenize(source: &str) -> Vec<Token<'_>> {
                 if cursor >= bytes.len() {
                     break;
                 }
-                if source[cursor..].starts_with("\\\"\"\"") {
+                if bytes[cursor..].starts_with(b"\\\"\"\"") {
                     cursor += 4;
-                } else if source[cursor..].starts_with("\"\"\"") {
+                } else if bytes[cursor..].starts_with(b"\"\"\"") {
                     cursor += 3;
                     break;
                 } else {
@@ -157,7 +173,7 @@ fn tokenize(source: &str) -> Vec<Token<'_>> {
                 }
             }
             index = cursor;
-        } else if source[index..].starts_with("...") {
+        } else if bytes[index..].starts_with(b"...") {
             kind = TokenKind::Punct;
             index += 3;
         } else if b"!$&()=:@[]{}|".contains(&byte) {
@@ -185,14 +201,16 @@ fn tokenize(source: &str) -> Vec<Token<'_>> {
             }
         } else {
             kind = TokenKind::Unknown;
-            index += source[index..].chars().next().map_or(1, char::len_utf8);
+            // `index` is on a char boundary here (every branch above stops
+            // on an ASCII byte or EOF); step over one whole character.
+            index = (index + utf8_width(byte)).min(bytes.len());
         }
         // Block strings may span lines; keep the counters exact.
         advance(bytes, start_index, index, &mut line, &mut line_start);
         let end = (line, (index - line_start) as u32);
         tokens.push(Token {
             kind,
-            text: &source[start_index..index],
+            text: source.get(start_index..index).unwrap_or_default(),
             start,
             end,
         });
@@ -284,6 +302,21 @@ impl<'a> Parser<'a> {
             self.bump()
         } else {
             None
+        }
+    }
+
+    /// Run `parse` and return its rendering with the source span of the
+    /// tokens it consumed. When it consumed nothing (a missing type or
+    /// default in partially edited input) the span is zero-width at
+    /// `anchor`, the end of the preceding `:` / `=`, so it is never reversed.
+    fn spanned(&mut self, anchor: (u32, u32), parse: fn(&mut Self) -> String) -> (String, (u32, u32), (u32, u32)) {
+        let before = self.pos;
+        let start = self.peek().map_or(anchor, |t| t.start);
+        let rendered = parse(self);
+        if self.pos == before {
+            (rendered, anchor, anchor)
+        } else {
+            (rendered, start, self.last_end)
         }
     }
 
@@ -712,9 +745,8 @@ impl<'a> Parser<'a> {
         }
         if self.at_punct(":") {
             let colon = self.bump().expect("peeked");
-            let start = self.peek().map_or(colon.end, |t| t.start);
-            let rendered = self.type_ref();
-            node.children.push(Node::new("field_type", rendered, start, self.last_end));
+            let (rendered, start, end) = self.spanned(colon.end, Self::type_ref);
+            node.children.push(Node::new("field_type", rendered, start, end));
         }
         self.directives(&mut node.children);
         Some(node)
@@ -732,15 +764,13 @@ impl<'a> Parser<'a> {
         let mut default_node = None;
         if self.at_punct(":") {
             let colon = self.bump().expect("peeked");
-            let start = self.peek().map_or(colon.end, |t| t.start);
-            let rendered = self.type_ref();
-            type_node = Some(Node::new("field_type", rendered, start, self.last_end));
+            let (rendered, start, end) = self.spanned(colon.end, Self::type_ref);
+            type_node = Some(Node::new("field_type", rendered, start, end));
         }
         if self.at_punct("=") {
             let equals = self.bump().expect("peeked");
-            let start = self.peek().map_or(equals.end, |t| t.start);
-            let rendered = self.value();
-            default_node = Some(Node::new("default_value", rendered, start, self.last_end));
+            let (rendered, start, end) = self.spanned(equals.end, Self::value);
+            default_node = Some(Node::new("default_value", rendered, start, end));
         }
         let mut node = if node_type == "argument" {
             let mut label = name.text.to_string();
@@ -1363,5 +1393,108 @@ fragment UserFields on User {
             tree("type User {\n  id: ID\n}\n").structural_hash,
             tree("type User {\n  id: ID\n}\n\nty").structural_hash
         );
+    }
+
+    #[test]
+    fn block_strings_with_non_ascii_text_do_not_panic() {
+        // Codex P1 on PR #9: the block-string scanner advanced one byte at a
+        // time and sliced `&str` inside multibyte characters.
+        let cases = [
+            ("\"\"\"café\"\"\" type T { a: Int }", "café"),
+            ("\"\"\"rocket 🚀 launch\"\"\"\ntype T { a: Int }\n", "🚀"),
+            ("\"\"\"用户类型\"\"\"\ntype T { a: Int }\n", "用户类型"),
+            ("\"\"\"say \\\"\"\" é \\\"\"\" ok\"\"\"\ntype T { a: Int }\n", "\\\"\"\" é"),
+            ("\"\"\"ends with é\"\"\"\ntype T { a: Int }\n", "é"),
+            ("\"\"\"ends with 🚀\"\"\"\ntype T { a: Int }\n", "🚀"),
+            ("\"\"\"ends with 字\"\"\"\ntype T { a: Int }\n", "字"),
+            ("\"\"\"\nmulti é\nline 🚀\n\"\"\"\ntype T { a: Int }\n", "line 🚀"),
+        ];
+        for (source, needle) in cases {
+            let root = tree(source);
+            assert_tree_valid(&root, source, &mut Vec::new());
+            let definition = &root.children[0];
+            assert_eq!(definition.label, "T", "{source:?}");
+            let description = first_of_type(definition, "description").expect("description");
+            assert!(description.label.contains(needle), "{source:?}: {:?}", description.label);
+            assert!(description.label.ends_with("\"\"\""), "{source:?}: {:?}", description.label);
+            let mut labels = Vec::new();
+            labels_by_type(&root, "unparsed", &mut labels);
+            assert!(labels.is_empty(), "{source:?}: {labels:?}");
+        }
+        // Block strings as argument values and unterminated non-ASCII ones.
+        for source in [
+            "query Q { a(t: \"\"\"naïve ☃\"\"\") }\n",
+            "query Q { a(t: \"\"\"never closed é",
+            "query Q { a(t: \"\"\"never closed 🚀\n",
+            "\"\"\"é",
+            "\"\"\"",
+            "\"\"\"\"",
+            "\"\"\"\\",
+            "\"\"\"é\\\"\"",
+        ] {
+            let root = tree(source);
+            assert_tree_valid(&root, source, &mut Vec::new());
+        }
+        let value = tree("query Q { a(t: \"\"\"naïve ☃\"\"\") }\n");
+        let mut arguments = Vec::new();
+        labels_by_type(&value, "argument", &mut arguments);
+        assert_eq!(arguments, vec!["t: \"\"\"naïve ☃\"\"\"".to_string()]);
+    }
+
+    #[test]
+    fn non_ascii_block_string_edits_change_hashes() {
+        let old = tree("\"\"\"café\"\"\"\ntype T { a: Int }\n");
+        let new = tree("\"\"\"cafe\"\"\"\ntype T { a: Int }\n");
+        assert_ne!(old.structural_hash, new.structural_hash);
+    }
+
+    #[test]
+    fn missing_declared_types_and_defaults_never_reverse_spans() {
+        // Codex P2 on PR #9: an absent type/default took `start` from the
+        // next token but `end` from the `:` / `=`, reversing the range.
+        let sources = [
+            "type T { a: }",
+            "type T { a:\n}\n",
+            "interface I { a: }",
+            "input I { a: }",
+            "input I { a:\n}\n",
+            "input I { a: Int = }",
+            "input I { a: Int =\n}\n",
+            "type T { f(x: ): Int }",
+            "type T { f(x:\n): Int }",
+            "type T { f(x: Int = ): Int }",
+            "directive @d(x: ) on FIELD",
+            "type T { a: @deprecated }",
+            "type T { a:",
+            "input I { a: Int =",
+        ];
+        for source in sources {
+            let root = tree(source);
+            assert_tree_valid(&root, source, &mut Vec::new());
+        }
+        // A missing type is a zero-width marker right after the colon.
+        let root = tree("type T { a:\n}\n");
+        let field_type = first_of_type(&root, "field_type").expect("field_type");
+        assert_eq!(field_type.label, "");
+        assert_eq!(
+            (field_type.position.start_line, field_type.position.start_col, field_type.position.end_line, field_type.position.end_col),
+            (0, 11, 0, 11)
+        );
+        // A present type keeps its exact source span.
+        let root = tree("type T { a: [Int!]! }");
+        let field_type = first_of_type(&root, "field_type").expect("field_type");
+        assert_eq!(field_type.label, "[Int!]!");
+        assert_eq!((field_type.position.start_col, field_type.position.end_col), (12, 19));
+    }
+
+    #[test]
+    fn every_truncation_of_non_ascii_source_is_valid() {
+        // Partially typed schemas: every char-boundary prefix must parse to
+        // a valid tree (no panic, no reversed or off-boundary spans).
+        let source = "\"\"\"Café 🚀 用户 \\\"\"\" é\"\"\"\ntype T implements I & J @d(x: \"ü\") {\n  \"naïve\" a(x: [Int!]! = [1, 2]): [Str!]!\n  b: Int = 3\n}\ninput In { v: Int = 1 }\nquery Q($x: Int = 2) { a(t: \"\"\"☃\"\"\") { ...F ... on T { b } } }\n";
+        for (end, _) in source.char_indices().chain(std::iter::once((source.len(), ' '))) {
+            let prefix = &source[..end];
+            assert_tree_valid(&tree(prefix), prefix, &mut Vec::new());
+        }
     }
 }
